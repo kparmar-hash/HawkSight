@@ -1,0 +1,4 @@
+ultralytics
+duckduckgo-search
+requests
+Pillow
