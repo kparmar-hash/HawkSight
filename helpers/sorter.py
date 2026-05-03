@@ -7,7 +7,7 @@ from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-DIRECTORY   = Path("dataset/raw/robots_static")
+DIRECTORY   = Path("dataset/raw/negative")
 START_AT    = 1       # change this to continue from a specific number
 IMAGE_EXTS  = {".jpg", ".jpeg", ".png", ".webp"}
 
@@ -23,7 +23,7 @@ def main():
     print(f"Found {len(files)} images. Renaming from robot_{START_AT:04d}…\n")
 
     for i, file in enumerate(files, start=START_AT):
-        new_name = DIRECTORY / f"robot_{i:04d}{file.suffix.lower()}"
+        new_name = DIRECTORY / f"negative_{i:04d}{file.suffix.lower()}"
         if file == new_name:
             print(f"  [skip] {file.name} already correct")
             continue
