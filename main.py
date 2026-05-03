@@ -1,3 +1,10 @@
-from helpers.sorter import main as sort_images
+# from helpers.sorter import main
+# main()
 
-sort_images()
+from ultralytics import YOLO
+
+model = YOLO("runs/detect/robot_detection/weights/best.pt")
+
+result = model("dataset/raw/tests/tests_0004.png")
+result[0].show()
+
