@@ -1,195 +1,286 @@
 """
-HawkScan — Interactive Robot Identifier
-Click on a robot in the image — YOLO runs only on that region and draws one box.
+HawkScan — Live Video Detector
+Grabs the first frame from a video/stream, calibrates against it,
+then runs robot detection on every subsequent frame.
 
 Usage:
-    python identify.py                  (opens file picker)
-    python identify.py path/to/img.jpg  (opens directly)
+    python identify.py --topdown field.png --video match.mp4
+    python identify.py --topdown field.png --video 0           (webcam index)
+    python identify.py --topdown field.png --video match.mp4 --calib saved.json   (skip calibration)
+    python identify.py --topdown field.png --video match.mp4 --recalibrate        (force redo calib)
+    python identify.py --topdown field.png --video match.mp4 --save output.mp4
 """
 
-import sys
-import tkinter as tk
-from tkinter import filedialog
-from PIL import Image, ImageDraw, ImageTk
+import json
+import argparse
+import cv2
+import numpy as np
+from pathlib import Path
 from ultralytics import YOLO
+from ultralytics.utils.plotting import Annotator, colors
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 MODEL_PATH   = "runs/detect/robot_detector/weights/best.pt"
 CONF         = 0.25
-CROP_PADDING = 200    # px (original scale) added around the click to form the crop window
-BOX_COLOR    = "#FF3B3B"
-BOX_WIDTH    = 3
-MAX_DISPLAY  = 900    # max window dimension; image scales down to fit
+CALIB_FILE   = "hawkscan_calib.json"
+PANEL_HEIGHT = 700
+MIN_POINTS   = 4
 
-# ── App ───────────────────────────────────────────────────────────────────────
+ZONE_BEHAVIOR = {
+    "red_alliance_zone":  "SHOOTING",
+    "blue_alliance_zone": "SHOOTING",
+    "neutral_zone":       "FERRYING",
+}
 
-class HawkScanApp:
-    def __init__(self, root: tk.Tk, image_path: str):
-        self.root = root
-        self.root.title("HawkScan — Click a robot")
-        self.root.configure(bg="#1a1a1a")
+DEFAULT_ZONE_FRACS = {
+    "red_alliance_zone":  (0.00, 0.00, 0.25, 1.00),
+    "neutral_zone":       (0.25, 0.00, 0.75, 1.00),
+    "blue_alliance_zone": (0.75, 0.00, 1.00, 1.00),
+}
 
-        self.model    = YOLO(MODEL_PATH)
-        self.original = Image.open(image_path).convert("RGB")
-        self.orig_w, self.orig_h = self.original.size
-        self.scale    = self._fit_scale(self.original.size, MAX_DISPLAY)
-        dw = int(self.orig_w * self.scale)
-        dh = int(self.orig_h * self.scale)
-        self.display_base = self.original.resize((dw, dh), Image.LANCZOS)
-        self.active_box   = None   # (x1, y1, x2, y2, conf) in original coords
+# ── Calibration UI ────────────────────────────────────────────────────────────
 
-        self._build_ui(dw, dh)
-        self._refresh_canvas()
-        self._set_status("Click on a robot to identify it.")
+class CalibState:
+    def __init__(self):
+        self.pairs      = []   # [(td_pt, cam_pt), ...]
+        self.left_click = None
+        self.side       = "left"
 
-    # ── UI ────────────────────────────────────────────────────────────────────
+    def undo(self):
+        if self.pairs:
+            self.pairs.pop()
+            self.left_click = None
+            self.side = "left"
 
-    def _build_ui(self, w: int, h: int):
-        self.status_var = tk.StringVar()
-        tk.Label(
-            self.root, textvariable=self.status_var,
-            bg="#1a1a1a", fg="#ffffff",
-            font=("Helvetica", 12), pady=8
-        ).pack(fill=tk.X)
+calib_state = CalibState()
+td_panel_w  = 0
+td_scale    = 1.0
+cam_scale   = 1.0
 
-        self.canvas = tk.Canvas(
-            self.root, width=w, height=h,
-            bg="#1a1a1a", highlightthickness=0, cursor="crosshair"
-        )
-        self.canvas.pack(padx=16, pady=(0, 8))
-        self.canvas.bind("<Button-1>", self._on_click)
+def mouse_cb(event, x, y, flags, param):
+    if event != cv2.EVENT_LBUTTONDOWN:
+        return
+    on_left = x < td_panel_w
 
-        btn_frame = tk.Frame(self.root, bg="#1a1a1a")
-        btn_frame.pack(pady=(0, 12))
+    if calib_state.side == "left" and on_left:
+        calib_state.left_click = (x / td_scale, y / td_scale)
+        calib_state.side = "right"
+        print(f"  [{len(calib_state.pairs)+1}] Top-down clicked — now click the same point on the camera frame")
 
-        for label, cmd in [("Clear", self._clear), ("Open New Image", self._open_new)]:
-            tk.Button(
-                btn_frame, text=label, command=cmd,
-                bg="#333333", fg="#ffffff",
-                font=("Helvetica", 11), relief="flat", padx=12, pady=4
-            ).pack(side=tk.LEFT, padx=6)
-
-    # ── Detection ─────────────────────────────────────────────────────────────
-
-    def _detect_at(self, click_ox: float, click_oy: float):
-        """
-        Crop a window around (click_ox, click_oy) in original pixel coords,
-        run YOLO on just that patch, then return the best box remapped back
-        to original coords — or None if nothing found.
-        """
-        pad = CROP_PADDING
-
-        # Clamp crop to image bounds
-        cx1 = max(0,           int(click_ox - pad))
-        cy1 = max(0,           int(click_oy - pad))
-        cx2 = min(self.orig_w, int(click_ox + pad))
-        cy2 = min(self.orig_h, int(click_oy + pad))
-
-        crop    = self.original.crop((cx1, cy1, cx2, cy2))
-        results = self.model(crop, conf=CONF, verbose=False)
-
-        if not results[0].boxes:
-            return None
-
-        # Pick the detection whose centre is closest to the click (in crop space)
-        click_in_crop_x = click_ox - cx1
-        click_in_crop_y = click_oy - cy1
-        best, best_dist = None, float("inf")
-
-        for box in results[0].boxes:
-            bx1, by1, bx2, by2 = box.xyxy[0].tolist()
-            cx = (bx1 + bx2) / 2
-            cy = (by1 + by2) / 2
-            dist = (cx - click_in_crop_x) ** 2 + (cy - click_in_crop_y) ** 2
-            if dist < best_dist:
-                best_dist = dist
-                best = (bx1, by1, bx2, by2, box.conf.item())
-
-        if best is None:
-            return None
-
-        # Remap from crop coords → original image coords
-        bx1, by1, bx2, by2, conf = best
-        return (bx1 + cx1, by1 + cy1, bx2 + cx1, by2 + cy1, conf)
-
-    # ── Canvas ────────────────────────────────────────────────────────────────
-
-    def _refresh_canvas(self):
-        img = self.display_base.copy()
-
-        if self.active_box:
-            x1, y1, x2, y2, conf = self.active_box
-            sx1 = int(x1 * self.scale)
-            sy1 = int(y1 * self.scale)
-            sx2 = int(x2 * self.scale)
-            sy2 = int(y2 * self.scale)
-
-            draw = ImageDraw.Draw(img)
-            for t in range(BOX_WIDTH):
-                draw.rectangle([sx1-t, sy1-t, sx2+t, sy2+t], outline=BOX_COLOR)
-            label = f"FRC Robot  {conf:.0%}"
-            draw.rectangle([sx1, sy1 - 22, sx1 + len(label)*8 + 8, sy1], fill=BOX_COLOR)
-            draw.text((sx1 + 4, sy1 - 20), label, fill="#ffffff")
-
-        self._tk_img = ImageTk.PhotoImage(img)
-        self.canvas.delete("all")
-        self.canvas.create_image(0, 0, anchor=tk.NW, image=self._tk_img)
-
-    # ── Interaction ───────────────────────────────────────────────────────────
-
-    def _on_click(self, event):
-        ox = event.x / self.scale
-        oy = event.y / self.scale
-
-        self._set_status("Detecting…")
-        self.root.update_idletasks()
-
-        box = self._detect_at(ox, oy)
-
-        if box:
-            self.active_box = box
-            self._refresh_canvas()
-            self._set_status(f"Robot locked  ·  confidence {box[4]:.0%}")
-        else:
-            self._set_status("No robot found near that click — try clicking closer to the robot.")
-
-    def _clear(self):
-        self.active_box = None
-        self._refresh_canvas()
-        self._set_status("Click on a robot to identify it.")
-
-    def _open_new(self):
-        path = filedialog.askopenfilename(
-            filetypes=[("Images", "*.jpg *.jpeg *.png *.webp *.bmp")]
-        )
-        if path:
-            self.root.destroy()
-            launch(path)
-
-    def _set_status(self, msg: str):
-        self.status_var.set(msg)
-
-    @staticmethod
-    def _fit_scale(size: tuple, max_dim: int) -> float:
-        return min(max_dim / size[0], max_dim / size[1], 1.0)
-
-# ── Entry point ───────────────────────────────────────────────────────────────
-
-def launch(path: str = None):
-    if path is None:
-        tmp = tk.Tk()
-        tmp.withdraw()
-        path = filedialog.askopenfilename(
-            title="Open image",
-            filetypes=[("Images", "*.jpg *.jpeg *.png *.webp *.bmp")]
-        )
-        tmp.destroy()
-        if not path:
+    elif calib_state.side == "right" and not on_left:
+        if calib_state.left_click is None:
             return
+        cam_x = (x - td_panel_w) / cam_scale
+        cam_y = y / cam_scale
+        calib_state.pairs.append((calib_state.left_click, (cam_x, cam_y)))
+        print(f"  Pair {len(calib_state.pairs)} set.{' Press ENTER to calibrate.' if len(calib_state.pairs) >= MIN_POINTS else ''}")
+        calib_state.left_click = None
+        calib_state.side = "left"
 
-    root = tk.Tk()
-    root.resizable(False, False)
-    HawkScanApp(root, path)
-    root.mainloop()
+def scale_to_height(img, h):
+    oh, ow = img.shape[:2]
+    s = h / oh
+    return cv2.resize(img, (int(ow * s), h)), s
 
+def draw_calib_panel(img, pts, pending, label, scale):
+    vis = img.copy()
+    for i, pt in enumerate(pts):
+        sx, sy = int(pt[0] * scale), int(pt[1] * scale)
+        cv2.circle(vis, (sx, sy), 7, (0, 255, 80), -1)
+        cv2.putText(vis, str(i+1), (sx+9, sy-9), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 80), 2)
+    if pending:
+        sx, sy = int(pending[0] * scale), int(pending[1] * scale)
+        cv2.circle(vis, (sx, sy), 7, (0, 200, 255), 2)
+    cv2.putText(vis, label, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+    return vis
+
+def run_calibration(td_img, cam_frame, calib_out_path):
+    global td_panel_w, td_scale, cam_scale, calib_state
+    calib_state = CalibState()
+
+    td_disp,  td_scale  = scale_to_height(td_img,    PANEL_HEIGHT)
+    cam_disp, cam_scale = scale_to_height(cam_frame, PANEL_HEIGHT)
+    td_panel_w = td_disp.shape[1]
+
+    # Build zones from fracs
+    h, w = td_img.shape[:2]
+    zones = {
+        name: (xf1*w, yf1*h, xf2*w, yf2*h)
+        for name, (xf1, yf1, xf2, yf2) in DEFAULT_ZONE_FRACS.items()
+    }
+
+    print("\nHawkScan Calibration")
+    print("────────────────────────────────────────────────────")
+    print("LEFT panel = top-down field map")
+    print("RIGHT panel = first frame of your video")
+    print(f"Click {MIN_POINTS}+ matching landmark pairs (field corners work best).")
+    print("Click LEFT first, then the same point on the RIGHT.")
+    print("R = undo  |  ENTER = save & start detection  |  Q = quit\n")
+
+    cv2.namedWindow("HawkScan Calibration", cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback("HawkScan Calibration", mouse_cb)
+
+    while True:
+        n     = len(calib_state.pairs)
+        ready = n >= MIN_POINTS
+
+        left_pts  = [p[0] for p in calib_state.pairs]
+        right_pts = [p[1] for p in calib_state.pairs]
+
+        left_label  = f"TOP-DOWN  ({n} pairs){'  ENTER=start' if ready else '  — click here first'}"
+        right_label = f"CAMERA FRAME{'  — click matching point' if calib_state.side=='right' else ''}"
+
+        td_vis  = draw_calib_panel(td_disp.copy(), left_pts, calib_state.left_click, left_label, td_scale)
+        cam_vis = draw_calib_panel(cam_disp.copy(), right_pts, None, right_label, cam_scale)
+        frame   = np.hstack([td_vis, cam_vis])
+        cv2.line(frame, (td_panel_w, 0), (td_panel_w, PANEL_HEIGHT), (80, 80, 80), 2)
+
+        cv2.imshow("HawkScan Calibration", frame)
+        key = cv2.waitKey(20) & 0xFF
+
+        if key == ord('r'):
+            calib_state.undo()
+            print("  Undid last pair.")
+        elif key == ord('q'):
+            cv2.destroyAllWindows()
+            return None
+        elif key == 13 and ready:   # ENTER
+            td_pts  = np.float32([p[0] for p in calib_state.pairs])
+            cam_pts = np.float32([p[1] for p in calib_state.pairs])
+            H, mask = cv2.findHomography(cam_pts, td_pts, cv2.RANSAC, 5.0)
+            inliers = int(mask.sum()) if mask is not None else n
+            print(f"\n  Homography computed — {inliers}/{n} inliers")
+
+            calib = {
+                "topdown_size": [td_img.shape[1], td_img.shape[0]],
+                "homography":   H.tolist(),
+                "zones":        {k: list(v) for k, v in zones.items()},
+            }
+            with open(calib_out_path, "w") as f:
+                json.dump(calib, f, indent=2)
+            print(f"  Saved → {calib_out_path}\n")
+            cv2.destroyAllWindows()
+            return calib
+
+# ── Detection ─────────────────────────────────────────────────────────────────
+
+def load_calib(path):
+    with open(path) as f:
+        calib = json.load(f)
+    calib["homography"] = np.float32(calib["homography"])
+    return calib
+
+def camera_to_topdown(px, py, H):
+    pt  = np.float32([[[px, py]]])
+    out = cv2.perspectiveTransform(pt, H)
+    return float(out[0][0][0]), float(out[0][0][1])
+
+def find_zone(tx, ty, zones):
+    for name, bounds in zones.items():
+        x1, y1, x2, y2 = bounds
+        if x1 <= tx <= x2 and y1 <= ty <= y2:
+            return name
+    return "unknown"
+
+def process_frame(frame, model, H, zones):
+    results = model(frame, conf=CONF, verbose=False)
+    r       = results[0]
+    ann     = Annotator(frame.copy())
+
+    for i, box in enumerate(r.boxes):
+        x1, y1, x2, y2 = box.xyxy[0].tolist()
+        conf = box.conf.item()
+        cx, cy   = (x1 + x2) / 2, (y1 + y2) / 2
+        tx, ty   = camera_to_topdown(cx, cy, H)
+        zone     = find_zone(tx, ty, zones)
+        behavior = ZONE_BEHAVIOR.get(zone, "UNKNOWN")
+        label    = f"{zone.replace('_',' ').upper()} | {behavior}"
+        ann.box_label([x1, y1, x2, y2], label, color=colors(i, True))
+
+    return ann.result()
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--topdown",     required=True, help="Top-down field map image")
+    parser.add_argument("--video",       required=True, help="Video file path or camera index (0, 1, …)")
+    parser.add_argument("--calib",       default=CALIB_FILE)
+    parser.add_argument("--recalibrate", action="store_true", help="Force redo calibration")
+    parser.add_argument("--save",        default=None, metavar="OUTPUT.mp4")
+    args = parser.parse_args()
+
+    td_img = cv2.imread(args.topdown)
+    if td_img is None:
+        print(f"Cannot open top-down image: {args.topdown}")
+        return
+
+    # Open video source
+    src = int(args.video) if args.video.isdigit() else args.video
+    cap = cv2.VideoCapture(src)
+    if not cap.isOpened():
+        print(f"Cannot open video: {args.video}")
+        return
+
+    ret, first_frame = cap.read()
+    if not ret:
+        print("Could not read first frame from video.")
+        return
+
+    # ── Calibration ───────────────────────────────────────────────────────────
+    calib_path = Path(args.calib)
+    if calib_path.exists() and not args.recalibrate:
+        print(f"Loading calibration from {calib_path}")
+        calib = load_calib(calib_path)
+    else:
+        print("Starting calibration against first video frame…")
+        calib = run_calibration(td_img, first_frame, calib_path)
+        if calib is None:
+            print("Calibration cancelled.")
+            cap.release()
+            return
+        calib["homography"] = np.float32(calib["homography"])
+
+    H     = calib["homography"]
+    zones = calib["zones"]
+
+    # ── Detection loop ────────────────────────────────────────────────────────
+    model = YOLO(MODEL_PATH)
+
+    writer = None
+    if args.save:
+        h, w = first_frame.shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(args.save, fourcc, cap.get(cv2.CAP_PROP_FPS) or 30, (w, h))
+
+    print("Running detection — press Q to quit.\n")
+
+    # Process first frame too
+    for frame in [first_frame]:
+        out = process_frame(frame, model, H, zones)
+        cv2.imshow("HawkScan", out)
+        if writer:
+            writer.write(out)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        out = process_frame(frame, model, H, zones)
+        cv2.imshow("HawkScan", out)
+        if writer:
+            writer.write(out)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    if writer:
+        writer.release()
+        print(f"Saved → {args.save}")
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
