@@ -3,8 +3,8 @@
 
 from ultralytics import YOLO
 
-model = YOLO("runs/detect/robot_detection/weights/best.pt")
 
-result = model("dataset/raw/tests/tests_0003.png")
-result[0].show()
+model = YOLO("runs/detect/robot_detector/weights/best.pt")
 
+results = model("dataset/raw/robot_static/robot_0097.png")
+results[0].show()

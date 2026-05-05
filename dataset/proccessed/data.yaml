@@ -1,6 +1,13 @@
-train: train/images
-val: train/images
-test: train/images
+train: ../train/images
+val: ../train/images
+test: ../train/images
 
-names: 
-  0: frc-robot
+nc: 1
+names: ['robot-detect']
+
+roboflow:
+  workspace: krishs-workspace-0wspr
+  project: krishs-workspace-0wspr
+  version: dataset
+  license: Private
+  url: https://app.roboflow.com/krishs-workspace-0wspr/krishs-workspace-0wspr/dataset
