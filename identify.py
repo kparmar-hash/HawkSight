@@ -4,11 +4,11 @@ Grabs the first frame from a video/stream, calibrates against it,
 then runs robot detection on every subsequent frame.
 
 Usage:
-    python identify.py --topdown field.png --video match.mp4
-    python identify.py --topdown field.png --video 0           (webcam index)
-    python identify.py --topdown field.png --video match.mp4 --calib saved.json   (skip calibration)
-    python identify.py --topdown field.png --video match.mp4 --recalibrate        (force redo calib)
-    python identify.py --topdown field.png --video match.mp4 --save output.mp4
+    python identify.py --topdown configs/field.png --video dataset/raw/tests/tests_0009.png
+    python run.py --topdown field.png --video 0           (webcam index)
+    python run.py --topdown field.png --video match.mp4 --calib saved.json   (skip calibration)
+    python run.py --topdown field.png --video match.mp4 --recalibrate        (force redo calib)
+    python run.py --topdown field.png --video match.mp4 --save output.mp4
 """
 
 import json
@@ -21,7 +21,7 @@ from ultralytics.utils.plotting import Annotator, colors
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-MODEL_PATH   = "runs/detect/robot_detector/weights/best.pt"
+MODEL_PATH   = "runs/detect/robot_detection-2/weights/best.pt"
 CONF         = 0.25
 CALIB_FILE   = "hawkscan_calib.json"
 PANEL_HEIGHT = 700
@@ -216,17 +216,31 @@ def main():
         print(f"Cannot open top-down image: {args.topdown}")
         return
 
-    # Open video source
-    src = int(args.video) if args.video.isdigit() else args.video
-    cap = cv2.VideoCapture(src)
-    if not cap.isOpened():
-        print(f"Cannot open video: {args.video}")
-        return
+    # Open video source — accept image files, video files, or camera index
+    IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    is_image   = Path(args.video).suffix.lower() in IMAGE_EXTS
 
-    ret, first_frame = cap.read()
-    if not ret:
-        print("Could not read first frame from video.")
-        return
+    if is_image:
+        first_frame = cv2.imread(args.video)
+        if first_frame is None:
+            print(f"Cannot open image: {args.video}")
+            return
+        cap = None
+    else:
+        src = int(args.video) if args.video.isdigit() else args.video
+        cap = cv2.VideoCapture(src)
+        if not cap.isOpened():
+            print(f"Cannot open video: {args.video}")
+            return
+        ret, first_frame = cap.read()
+        if not ret:
+            print("Could not read first frame from video.")
+            cap.release()
+            return
+
+    # Strip alpha channel if present (e.g. RGBA PNG)
+    if first_frame.shape[2] == 4:
+        first_frame = cv2.cvtColor(first_frame, cv2.COLOR_BGRA2BGR)
 
     # ── Calibration ───────────────────────────────────────────────────────────
     calib_path = Path(args.calib)
@@ -249,34 +263,37 @@ def main():
     model = YOLO(MODEL_PATH)
 
     writer = None
-    if args.save:
+    if args.save and not is_image:
         h, w = first_frame.shape[:2]
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(args.save, fourcc, cap.get(cv2.CAP_PROP_FPS) or 30, (w, h))
+        fps    = cap.get(cv2.CAP_PROP_FPS) if cap else 30
+        writer = cv2.VideoWriter(args.save, fourcc, fps or 30, (w, h))
 
     print("Running detection — press Q to quit.\n")
 
-    # Process first frame too
-    for frame in [first_frame]:
-        out = process_frame(frame, model, H, zones)
-        cv2.imshow("HawkScan", out)
-        if writer:
-            writer.write(out)
+    # Always process the first frame
+    out = process_frame(first_frame, model, H, zones)
+    cv2.imshow("HawkScan", out)
+    if writer:
+        writer.write(out)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    if is_image:
+        # Still image — just show result and wait for keypress
+        cv2.waitKey(0)
+    else:
+        # Video / stream loop
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            out = process_frame(frame, model, H, zones)
+            cv2.imshow("HawkScan", out)
+            if writer:
+                writer.write(out)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+        cap.release()
 
-        out = process_frame(frame, model, H, zones)
-        cv2.imshow("HawkScan", out)
-        if writer:
-            writer.write(out)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    cap.release()
     if writer:
         writer.release()
         print(f"Saved → {args.save}")
