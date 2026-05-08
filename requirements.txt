@@ -5,3 +5,6 @@ Pillow
 yt-dlp
 opencv-python
 tqdm
+supervision
+scikit-learn
+pyyaml
