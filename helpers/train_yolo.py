@@ -16,6 +16,7 @@ import shutil
 import yaml
 from pathlib import Path
 from sklearn.model_selection import train_test_split
+# pyrefly: ignore [missing-import]
 from ultralytics import YOLO
 
 
@@ -138,7 +139,7 @@ def train(
         batch=batch,
         project=project,
         name=name,
-        patience=10,          # early-stop if val/mAP50 doesn't improve for 10 epochs
+        patience=300,          # early-stop if val/mAP50 doesn't improve for 10 epochs
         save=True,
         plots=True,
         verbose=True,
