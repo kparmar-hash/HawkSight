@@ -8,3 +8,4 @@ tqdm
 supervision
 scikit-learn
 pyyaml
+numpy
