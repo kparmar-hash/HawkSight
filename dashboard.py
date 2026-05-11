@@ -84,7 +84,7 @@ class HawkSightDashboard:
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("HawkSight — Field Dashboard")
+        self.root.title("HawkSight — Path Dashboard")
         self.root.configure(bg=BG_DARK)
         self.root.minsize(960, 600)
 
