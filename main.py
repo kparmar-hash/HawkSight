@@ -1,3 +1,7 @@
+#TODO So the robot registry gets to 14 robots in total, however the robots keep swapping when they pass each other,
+# Is this just a training issue or could we help this with something in the code? Shorten robot registry to 6
+
+
 """
 FRC Robot Detector — Persistent IDs + Robot Registry
 =====================================================
@@ -67,6 +71,119 @@ def iou(a, b) -> float:
     return inter / (areaA + areaB - inter)
 
 
+def dedupe_multiview_detections(
+    detections: list[dict],
+    frame_width: int,
+    frame_height: int,
+    view_count: int,
+    match_threshold: float,
+) -> list[dict]:
+    """
+    Merge duplicate detections of the same robot across stitched camera views.
+
+    Assumes the full frame is split into `view_count` equal-width panes showing
+    the same field. Detections from different panes that land at nearly the same
+    normalized in-pane position are treated as the same physical robot.
+    """
+    if view_count <= 1 or len(detections) <= 1:
+        return detections
+
+    pane_width = frame_width / view_count
+    if pane_width <= 0 or frame_height <= 0:
+        return detections
+
+    enriched = []
+    for det in detections:
+        x1, y1, x2, y2 = det["box"]
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        view_idx = int(cx / pane_width)
+        view_idx = max(0, min(view_count - 1, view_idx))
+        local_x = (cx - (view_idx * pane_width)) / pane_width
+        local_y = cy / frame_height
+        enriched.append({
+            **det,
+            "view_idx": view_idx,
+            "norm_pos": (local_x, local_y),
+        })
+
+    groups: list[dict] = []
+    for det in sorted(enriched, key=lambda d: d.get("confidence", 0.0), reverse=True):
+        placed = False
+        for group in groups:
+            if det["class_id"] != group["class_id"]:
+                continue
+            if det["view_idx"] in group["views"]:
+                continue
+
+            gx, gy = group["norm_pos"]
+            dx = det["norm_pos"][0] - gx
+            dy = det["norm_pos"][1] - gy
+            if (dx * dx + dy * dy) ** 0.5 > match_threshold:
+                continue
+
+            group["members"].append(det)
+            group["views"].add(det["view_idx"])
+            count = len(group["members"])
+            group["norm_pos"] = (
+                ((gx * (count - 1)) + det["norm_pos"][0]) / count,
+                ((gy * (count - 1)) + det["norm_pos"][1]) / count,
+            )
+            if det.get("confidence", 0.0) > group["best"].get("confidence", 0.0):
+                group["best"] = det
+            placed = True
+            break
+
+        if not placed:
+            groups.append({
+                "class_id": det["class_id"],
+                "members": [det],
+                "views": {det["view_idx"]},
+                "norm_pos": det["norm_pos"],
+                "best": det,
+            })
+
+    merged = []
+    for group in groups:
+        best = dict(group["best"])
+        best["duplicate_views"] = sorted(group["views"])
+        best["duplicate_count"] = len(group["members"])
+        best.pop("view_idx", None)
+        best.pop("norm_pos", None)
+        merged.append(best)
+    return merged
+
+
+def filter_layout_detections(
+    detections: list[dict],
+    frame_width: int,
+    frame_height: int,
+    layout_mode: str,
+    main_view_bottom_ratio: float,
+) -> list[dict]:
+    """
+    Mark which detections may create brand-new robot IDs for known layouts.
+
+    `top-main-bottom-sides` matches the stream layout with one large full-field
+    view on top and two smaller inserts along the bottom. In that layout, the
+    top pane is the authoritative source for spawning registry IDs, but the
+    auxiliary views may still refresh already-known robots.
+    """
+    tagged = [dict(det, can_spawn=True) for det in detections]
+
+    if layout_mode == "full-frame":
+        return tagged
+
+    if layout_mode == "top-main-bottom-sides":
+        cutoff_y = int(frame_height * main_view_bottom_ratio)
+        for det in tagged:
+            center_y = (det["box"][1] + det["box"][3]) / 2.0
+            det["can_spawn"] = center_y <= cutoff_y
+        return tagged
+
+    return tagged
+
+
 # ─────────────────────────────────────────────────────────────
 # Track
 # ─────────────────────────────────────────────────────────────
@@ -134,7 +251,7 @@ class PersistentTracker:
 
     Pass 1 — active tracks matched by IoU.
     Pass 2 — ghost tracks matched by distance from dead-reckoned centroid.
-    Pass 3 — if roster < max_tracks: spawn new track.
+    Pass 3 — if roster < max_tracks: spawn new track from spawn-eligible views.
               if roster full: force onto nearest ghost (no distance limit).
               This guarantees IDs never exceed max_tracks after the roster
               fills, so robots reappearing from the trench or behind a
@@ -198,7 +315,7 @@ class PersistentTracker:
         roster_full = len(self.tracks) >= self.max_tracks
         for i in unmatched:
             det = detections[i]
-            if not roster_full:
+            if not roster_full and det.get("can_spawn", True):
                 self.tracks.append(
                     Track(det["box"], det["class_id"], det["class_name"], self.trail_len)
                 )
@@ -443,6 +560,10 @@ def process_video(
     ghost_dist:   int   = 120,
     pad:          int   = 18,
     max_robots:   int   = 6,
+    layout_mode:  str   = "full-frame",
+    main_view_bottom_ratio: float = 1.0,
+    view_count:   int   = 1,
+    cross_view_match: float = 0.08,
 ):
     print(f"Loading model: {weights_path}")
     model    = YOLO(str(weights_path))
@@ -498,7 +619,24 @@ def process_video(
                         "box":        list(map(int, xyxy[i])),
                         "class_id":   cid,
                         "class_name": result.names.get(cid, f"cls{cid}"),
+                        "confidence": float(result.boxes.conf[i]),
                     })
+
+            detections = filter_layout_detections(
+                detections=detections,
+                frame_width=w,
+                frame_height=h,
+                layout_mode=layout_mode,
+                main_view_bottom_ratio=main_view_bottom_ratio,
+            )
+
+            detections = dedupe_multiview_detections(
+                detections=detections,
+                frame_width=w,
+                frame_height=h,
+                view_count=view_count,
+                match_threshold=cross_view_match,
+            )
 
             tracks = tracker.update(detections)
             registry.update(tracks)
@@ -563,6 +701,15 @@ def main():
                    help="Pixels to expand each bounding box outward on all sides")
     p.add_argument("--max-robots",  type=int,   default=6,
                    help="Hard cap on unique IDs — match the number of robots on field")
+    p.add_argument("--layout-mode", type=str, default="full-frame",
+                   choices=["full-frame", "top-main-bottom-sides"],
+                   help="Broadcast layout used to decide which pane owns robot IDs")
+    p.add_argument("--main-view-bottom-ratio", type=float, default=1.0,
+                   help="Bottom Y ratio of the main top view when using top-main-bottom-sides")
+    p.add_argument("--view-count",  type=int,   default=1,
+                   help="Number of equal-width stitched views in each frame")
+    p.add_argument("--cross-view-match", type=float, default=0.08,
+                   help="Normalized distance threshold for merging the same robot across views")
     args = p.parse_args()
 
     process_video(
@@ -581,6 +728,10 @@ def main():
         ghost_dist   = args.ghost_dist,
         pad          = args.pad,
         max_robots   = args.max_robots,
+        layout_mode  = args.layout_mode,
+        main_view_bottom_ratio = args.main_view_bottom_ratio,
+        view_count   = args.view_count,
+        cross_view_match = args.cross_view_match,
     )
 
 if __name__ == "__main__":
