@@ -28,9 +28,10 @@ if os.path.isdir(_tcl_dir):
 
 import tkinter as tk
 from tkinter import messagebox
+import json
 from pathlib import Path
 # pyrefly: ignore [missing-import]
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw
 
 
 # ─────────────────────────────────────────────────────────────
@@ -81,6 +82,7 @@ class HawkSightDashboard:
     """Main dashboard window."""
 
     FIELD_IMAGE_PATH = Path(__file__).resolve().parent / "configs" / "field.png"
+    PATH_DATA_FILE   = Path(__file__).resolve().parent / "robot_paths.json"
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -96,6 +98,8 @@ class HawkSightDashboard:
 
         self._selected_robot: str | None = None
         self._robot_frames: dict[str, tk.Frame] = {}
+        self._robot_data: dict = {}
+        self._load_path_data()
 
         self._build_ui()
 
@@ -156,7 +160,15 @@ class HawkSightDashboard:
             anchor="w",
         ).pack(fill=tk.X, padx=18, pady=(10, 8))
 
-        for idx, robot in enumerate(ROBOTS):
+        # Use loaded robots or fall back to defaults
+        robots_to_show = []
+        if self._robot_data.get("robots"):
+            for r in self._robot_data["robots"]:
+                robots_to_show.append({"id": f"Robot {r['track_id']}", "track_id": r["track_id"]})
+        else:
+            robots_to_show = ROBOTS
+
+        for idx, robot in enumerate(robots_to_show):
             self._make_robot_card(sidebar, idx, robot)
 
         # Spacer
@@ -190,7 +202,7 @@ class HawkSightDashboard:
     # ── Robot card widget ────────────────────────────────────
 
     def _make_robot_card(self, parent: tk.Frame, idx: int, robot: dict):
-        accent = ROBOT_COLORS[idx]
+        accent = ROBOT_COLORS[idx % len(ROBOT_COLORS)]
         rid = robot["id"]
 
         card = tk.Frame(parent, bg=INACTIVE_BG, cursor="hand2", highlightthickness=0)
@@ -286,6 +298,7 @@ class HawkSightDashboard:
         self._selected_label.configure(text=f"▶  {robot_id}")
 
         print(f"[HawkSight] Selected robot: {robot_id}")
+        self._render_field()
 
     # ── Field image loading / resizing ───────────────────────
 
@@ -298,25 +311,86 @@ class HawkSightDashboard:
             )
             return
 
-        self._field_pil = Image.open(self.FIELD_IMAGE_PATH)
+        self._field_pil = Image.open(self.FIELD_IMAGE_PATH).convert("RGBA")
         self._render_field()
+
+    def _load_path_data(self):
+        if self.PATH_DATA_FILE.exists():
+            try:
+                with open(self.PATH_DATA_FILE, "r") as f:
+                    self._robot_data = json.load(f)
+                print(f"[HawkSight] Loaded path data for {len(self._robot_data.get('robots', []))} robots")
+            except Exception as e:
+                print(f"[HawkSight] Error loading path data: {e}")
+        else:
+            print("[HawkSight] No robot_paths.json found, using placeholders.")
 
     def _render_field(self):
         if not hasattr(self, "_field_pil"):
             return
 
+        # Start with a fresh copy of the field image
+        display_img = self._field_pil.copy()
+        
+        # If a robot is selected, draw its path
+        if self._selected_robot and self._selected_robot.startswith("Robot "):
+            try:
+                track_id = int(self._selected_robot.split(" ")[1])
+                robot_entry = next((r for r in self._robot_data.get("robots", []) if r["track_id"] == track_id), None)
+                if robot_entry and robot_entry.get("path"):
+                    self._draw_robot_path(display_img, robot_entry, track_id)
+            except Exception as e:
+                print(f"[HawkSight] Error drawing path: {e}")
+
         # Fit image into available space while preserving aspect ratio
         lbl_w = self._field_label.winfo_width()  or 800
         lbl_h = self._field_label.winfo_height() or 600
 
-        img_w, img_h = self._field_pil.size
+        img_w, img_h = display_img.size
         scale = min(lbl_w / img_w, lbl_h / img_h, 1.0)
         new_w = max(1, int(img_w * scale))
         new_h = max(1, int(img_h * scale))
 
-        resized = self._field_pil.resize((new_w, new_h), Image.LANCZOS)
+        resized = display_img.resize((new_w, new_h), Image.LANCZOS)
         self._field_photo = ImageTk.PhotoImage(resized)
         self._field_label.configure(image=self._field_photo)
+
+    def _draw_robot_path(self, img, robot_entry, track_id):
+        draw = ImageDraw.Draw(img)
+        path = robot_entry["path"]
+        if len(path) < 2:
+            return
+
+        # Determine robot colour
+        # Map track_id to ROBOT_COLORS
+        color_hex = ROBOT_COLORS[track_id % len(ROBOT_COLORS)]
+        # Convert hex to RGB
+        r = int(color_hex[1:3], 16)
+        g = int(color_hex[3:5], 16)
+        b = int(color_hex[5:7], 16)
+        color = (r, g, b, 200)
+
+        # Use video dimensions from loaded JSON if available
+        video_info = self._robot_data.get("video_info", {})
+        video_w = video_info.get("width", 1280)
+        video_h = video_info.get("height", 720)
+        
+        img_w, img_h = img.size
+        
+        points = []
+        for x, y in path:
+            nx = (x / video_w) * img_w
+            ny = (y / video_h) * img_h
+            points.append((nx, ny))
+        
+        # Draw path lines
+        draw.line(points, fill=color, width=5)
+        
+        # Draw circles at points
+        for i, (px, py) in enumerate(points):
+            if i % 5 == 0 or i == len(points) - 1: # Draw every 5th point to avoid clutter
+                radius = 4
+                draw.ellipse([px-radius, py-radius, px+radius, py+radius], fill=color, outline="white")
 
     def _on_field_resize(self, _event):
         self._render_field()

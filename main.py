@@ -21,6 +21,7 @@ Key flags:
 
 import argparse
 import time
+import json
 from pathlib import Path
 
 import cv2
@@ -227,6 +228,7 @@ class RobotEntry:
         self.frames_seen = 0
         self.frames_lost = 0
         self.status      = "ACTIVE"   # ACTIVE | GHOST | LOST
+        self.path        = []         # List of (x, y) centroids
 
 
 class RobotRegistry:
@@ -234,6 +236,8 @@ class RobotRegistry:
 
     def __init__(self):
         self.entries: dict[int, RobotEntry] = {}
+        self.video_width = 0
+        self.video_height = 0
 
     def update(self, tracks: list):
         live_ids = {t.id for t in tracks}
@@ -245,6 +249,9 @@ class RobotRegistry:
                 e.frames_seen += 1
                 e.frames_lost  = 0
                 e.status       = "ACTIVE"
+                # Record the centroid for path annotation
+                cx, cy = t.pred_cx, t.pred_cy
+                e.path.append((int(cx), int(cy)))
             else:
                 e.frames_lost  = t.lost
                 e.status       = "GHOST"
@@ -254,6 +261,27 @@ class RobotRegistry:
 
     def ordered(self) -> list:
         return sorted(self.entries.values(), key=lambda e: e.track_id)
+
+    def save_json(self, output_path: Path):
+        """Save the registry data to a JSON file."""
+        data = {
+            "video_info": {
+                "width": self.video_width,
+                "height": self.video_height
+            },
+            "robots": [
+                {
+                    "track_id": e.track_id,
+                    "class_name": e.class_name,
+                    "frames_seen": e.frames_seen,
+                    "path": e.path
+                }
+                for e in self.ordered()
+            ]
+        }
+        with open(output_path, "w") as f:
+            json.dump(data, f, indent=4)
+        print(f"Registry saved to {output_path}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -435,6 +463,9 @@ def process_video(
     src_fps      = cap.get(cv2.CAP_PROP_FPS) or 30.0
     w            = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h            = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    registry.video_width = w
+    registry.video_height = h
     print(f"Video: {w}x{h}  {src_fps:.2f} fps  {total_frames} frames")
 
     writer = cv2.VideoWriter(
@@ -503,6 +534,8 @@ def process_video(
     for e in registry.ordered():
         print(f"  #{e.track_id}  {e.class_name:<12}  seen:{e.frames_seen:>5}f  {e.status}")
     print(f"Output: {output_path}\n")
+
+    return registry
 
 
 # ─────────────────────────────────────────────────────────────
