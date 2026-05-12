@@ -28,12 +28,17 @@ import time
 import json
 from pathlib import Path
 
+# pyrefly: ignore [missing-import]
 import cv2
+# pyrefly: ignore [missing-import]
 import numpy as np
 from tqdm import tqdm
+# pyrefly: ignore [missing-import]
 from ultralytics import YOLO
+# pyrefly: ignore [missing-import]
 from ultralytics.utils.plotting import Annotator
 
+# pyrefly: ignore [missing-import]
 from scipy.optimize import linear_sum_assignment
 
 
@@ -318,17 +323,131 @@ class PersistentTracker:
         cx, cy = self._centroid(box)
         return ((cx-tx)**2 + (cy-ty)**2) ** 0.5
 
-    def _nearby_tracks(self, tracks, proximity_px=60):
-        """Return set of track IDs that are close to another track (crowded region)."""
-        crowded = set()
-        for i, a in enumerate(tracks):
-            for b in tracks[i+1:]:
-                if self._dist(a.pred_box, b.pred_cx, b.pred_cy) < proximity_px:
-                    crowded.add(a.id)
-                    crowded.add(b.id)
-        return crowded
+    def _nearby_tracks(self, tracks: list[Track], distance_px: float = 120.0) -> set[int]:
+        crowded_ids: set[int] = set()
+        for i, track_a in enumerate(tracks):
+            for track_b in tracks[i + 1:]:
+                dist = self._dist(track_a.box, track_b.pred_cx, track_b.pred_cy)
+                if dist <= distance_px:
+                    crowded_ids.add(track_a.id)
+                    crowded_ids.add(track_b.id)
+        return crowded_ids
 
     def update(self, detections: list[dict], frame=None) -> list[Track]:
+        main_detections = [det for det in detections if det.get("can_spawn", True)]
+        aux_detections = [det for det in detections if not det.get("can_spawn", True)]
+        unmatched_main = list(range(len(main_detections)))
+
+        # The main view is authoritative for matching and spawning IDs.
+        active = [t for t in self.tracks if not t.is_ghost]
+        matched_track_ids = set()
+        if active and unmatched_main:
+            crowded_ids = self._nearby_tracks(active)
+            cost = np.ones((len(active), len(main_detections)))
+            for ti, t in enumerate(active):
+                for di in unmatched_main:
+                    iou_score = iou(main_detections[di]["box"], t.box)
+                    if iou_score < self.iou_threshold:
+                        continue
+
+                    geo_cost = 1.0 - iou_score
+                    if t.id in crowded_ids and t.appearance is not None:
+                        det_hist = color_histogram(frame, main_detections[di]["box"]) if frame is not None else None
+                        app_cost = hist_distance(t.appearance, det_hist) if det_hist is not None else 0.5
+                        cost[ti, di] = (1 - self.appearance_weight) * geo_cost + self.appearance_weight * app_cost
+                    else:
+                        cost[ti, di] = geo_cost
+
+            row_ind, col_ind = linear_sum_assignment(cost)
+            matched_det_ids = set()
+            for ti, di in zip(row_ind, col_ind):
+                if cost[ti, di] < 1.0:
+                    active[ti].confirm(main_detections[di]["box"], frame)
+                    matched_track_ids.add(active[ti].id)
+                    matched_det_ids.add(di)
+
+            unmatched_main = [i for i in unmatched_main if i not in matched_det_ids]
+
+        for t in active:
+            if t.id not in matched_track_ids:
+                t.extrapolate()
+
+        ghosts = [t for t in self.tracks if t.is_ghost]
+        matched_ghost_ids = set()
+        for t in ghosts:
+            best_d, best_i = self.ghost_dist_px, None
+            for i in unmatched_main:
+                d = self._dist(main_detections[i]["box"], t.pred_cx, t.pred_cy)
+                if d < best_d:
+                    best_d, best_i = d, i
+            if best_i is not None:
+                t.confirm(main_detections[best_i]["box"], frame)
+                matched_ghost_ids.add(t.id)
+                unmatched_main.remove(best_i)
+        for t in ghosts:
+            if t.id not in matched_ghost_ids:
+                t.extrapolate()
+
+        roster_full = len(self.tracks) >= self.max_tracks
+        spawned_or_forced_ids = set()
+        for i in unmatched_main:
+            det = main_detections[i]
+            if not roster_full:
+                new_track = Track(det["box"], det["class_id"], det["class_name"],
+                                  self.trail_len, frame)
+                self.tracks.append(new_track)
+                spawned_or_forced_ids.add(new_track.id)
+                roster_full = len(self.tracks) >= self.max_tracks
+            else:
+                all_ghosts = [t for t in self.tracks if t.is_ghost]
+                if all_ghosts:
+                    nearest = min(
+                        all_ghosts,
+                        key=lambda t: self._dist(det["box"], t.pred_cx, t.pred_cy),
+                    )
+                    nearest.confirm(det["box"], frame)
+                    spawned_or_forced_ids.add(nearest.id)
+
+        # Auxiliary views can refine existing tracks, but never spawn IDs.
+        unmatched_aux = list(range(len(aux_detections)))
+        main_claimed_ids = matched_track_ids | matched_ghost_ids | spawned_or_forced_ids
+
+        aux_active = [t for t in self.tracks if not t.is_ghost and t.id not in main_claimed_ids]
+        matched_aux_track_ids = set()
+        if aux_active and unmatched_aux:
+            cost = np.ones((len(aux_active), len(aux_detections)))
+            for ti, t in enumerate(aux_active):
+                for di in unmatched_aux:
+                    iou_score = iou(aux_detections[di]["box"], t.box)
+                    if iou_score >= self.iou_threshold:
+                        cost[ti, di] = 1.0 - iou_score
+
+            row_ind, col_ind = linear_sum_assignment(cost)
+            matched_aux_det_ids = set()
+            for ti, di in zip(row_ind, col_ind):
+                if cost[ti, di] < 1.0:
+                    aux_active[ti].confirm(aux_detections[di]["box"], frame)
+                    matched_aux_track_ids.add(aux_active[ti].id)
+                    matched_aux_det_ids.add(di)
+            unmatched_aux = [i for i in unmatched_aux if i not in matched_aux_det_ids]
+
+        aux_ghosts = [
+            t for t in self.tracks
+            if t.is_ghost and t.id not in main_claimed_ids and t.id not in matched_aux_track_ids
+        ]
+        for t in aux_ghosts:
+            best_d, best_i = self.ghost_dist_px, None
+            for i in unmatched_aux:
+                d = self._dist(aux_detections[i]["box"], t.pred_cx, t.pred_cy)
+                if d < best_d:
+                    best_d, best_i = d, i
+            if best_i is not None:
+                t.confirm(aux_detections[best_i]["box"], frame)
+                unmatched_aux.remove(best_i)
+
+        self.tracks = [t for t in self.tracks if t.lost <= self.max_lost]
+        return self.tracks
+
         unmatched = list(range(len(detections)))
 
         # Pass 1 — Hungarian IoU match to active tracks
