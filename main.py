@@ -34,6 +34,8 @@ from tqdm import tqdm
 from ultralytics import YOLO
 from ultralytics.utils.plotting import Annotator
 
+from scipy.optimize import linear_sum_assignment
+
 
 # ─────────────────────────────────────────────────────────────
 # Palette — indexed by track ID, never changes
@@ -55,6 +57,29 @@ PALETTE = [
 def _color(track_id: int) -> tuple:
     return PALETTE[track_id % len(PALETTE)]
 
+
+# -------------------------------------------------------------
+# Histogram
+# -------------------------------------------------------------
+
+def color_histogram(frame, box, bins=16) -> np.ndarray:
+    """Small HSV histogram of the cropped box region."""
+    fh, fw = frame.shape[:2]
+    x1, y1 = max(0, box[0]), max(0, box[1])
+    x2, y2 = min(fw, box[2]), min(fh, box[3])
+    if x2 <= x1 or y2 <= y1:
+        return np.zeros(bins * 2, dtype=np.float32)
+    crop = frame[y1:y2, x1:x2]
+    hsv  = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    h_hist = cv2.calcHist([hsv], [0], None, [bins], [0, 180]).flatten()
+    s_hist = cv2.calcHist([hsv], [1], None, [bins], [0, 256]).flatten()
+    hist   = np.concatenate([h_hist, s_hist])
+    norm   = hist.sum()
+    return hist / norm if norm > 0 else hist
+
+def hist_distance(a: np.ndarray, b: np.ndarray) -> float:
+    """0 = identical, 1 = completely different."""
+    return float(cv2.compareHist(a, b, cv2.HISTCMP_BHATTACHARYYA))
 
 # ─────────────────────────────────────────────────────────────
 # IoU
@@ -191,17 +216,32 @@ def filter_layout_detections(
 class Track:
     _next_id = 0
 
-    def __init__(self, box: list, class_id: int, class_name: str, trail_len: int):
-        self.id         = Track._next_id
-        Track._next_id += 1
-        self.class_id   = class_id
-        self.class_name = class_name
-        self.box        = box
-        self.trail_len  = trail_len
-        self.centroids  = [self._centroid(box)]
-        self.lost       = 0
-        self.pred_box   = list(box)
+    def __init__(self, box, class_id, class_name, trail_len, frame=None):
+        self.id          = Track._next_id
+        Track._next_id  += 1
+        self.class_id    = class_id
+        self.class_name  = class_name
+        self.box         = box
+        self.trail_len   = trail_len
+        self.centroids   = [self._centroid(box)]
+        self.lost        = 0
+        self.pred_box    = list(box)
         self.pred_cx, self.pred_cy = self._centroid(box)
+        # Appearance: rolling average of last N histograms
+        self.appearance: np.ndarray | None = (
+            color_histogram(frame, box) if frame is not None else None
+        )
+
+
+    def update_appearance(self, frame, box, alpha=0.3):
+        """Exponential moving average so appearance adapts slowly."""
+        new_hist = color_histogram(frame, box)
+        if self.appearance is None:
+            self.appearance = new_hist
+        else:
+            self.appearance = (1 - alpha) * self.appearance + alpha * new_hist
+
+    
 
     @staticmethod
     def _centroid(box) -> tuple:
@@ -214,7 +254,7 @@ class Track:
         dy = self.centroids[-1][1] - self.centroids[0][1]
         return (dx / (len(self.centroids)-1), dy / (len(self.centroids)-1))
 
-    def confirm(self, box: list):
+    def confirm(self, box, frame=None):
         self.box  = box
         self.lost = 0
         c = self._centroid(box)
@@ -223,6 +263,8 @@ class Track:
             self.centroids.pop(0)
         self.pred_box = list(box)
         self.pred_cx, self.pred_cy = c
+        if frame is not None:
+            self.update_appearance(frame, box)
 
     def extrapolate(self):
         self.lost += 1
@@ -259,42 +301,78 @@ class PersistentTracker:
     """
 
     def __init__(self, iou_threshold=0.25, ghost_dist_px=120,
-                 max_lost=150, trail_len=8, max_tracks=6):
-        self.iou_threshold = iou_threshold
-        self.ghost_dist_px = ghost_dist_px
-        self.max_lost      = max_lost
-        self.trail_len     = trail_len
-        self.max_tracks    = max_tracks
+                 max_lost=150, trail_len=8, max_tracks=6,
+                 appearance_weight=0.35):
+        self.iou_threshold    = iou_threshold
+        self.ghost_dist_px    = ghost_dist_px
+        self.max_lost         = max_lost
+        self.trail_len        = trail_len
+        self.max_tracks       = max_tracks
+        self.appearance_weight = appearance_weight  # 0 = pure geometry, 1 = pure appearance
         self.tracks: list[Track] = []
 
     def _centroid(self, box):
         return ((box[0]+box[2])//2, (box[1]+box[3])//2)
 
-    def _dist(self, box, tx, ty) -> float:
+    def _dist(self, box, tx, ty):
         cx, cy = self._centroid(box)
         return ((cx-tx)**2 + (cy-ty)**2) ** 0.5
 
-    def update(self, detections: list[dict]) -> list[Track]:
+    def _nearby_tracks(self, tracks, proximity_px=60):
+        """Return set of track IDs that are close to another track (crowded region)."""
+        crowded = set()
+        for i, a in enumerate(tracks):
+            for b in tracks[i+1:]:
+                if self._dist(a.pred_box, b.pred_cx, b.pred_cy) < proximity_px:
+                    crowded.add(a.id)
+                    crowded.add(b.id)
+        return crowded
+
+    def update(self, detections: list[dict], frame=None) -> list[Track]:
         unmatched = list(range(len(detections)))
 
-        # Pass 1 — IoU match to active tracks
+        # Pass 1 — Hungarian IoU match to active tracks
         active = [t for t in self.tracks if not t.is_ghost]
-        matched = set()
-        for t in active:
-            best_s, best_i = self.iou_threshold, None
-            for i in unmatched:
-                s = iou(detections[i]["box"], t.box)
-                if s > best_s:
-                    best_s, best_i = s, i
-            if best_i is not None:
-                t.confirm(detections[best_i]["box"])
-                matched.add(t.id)
-                unmatched.remove(best_i)
-        for t in active:
-            if t.id not in matched:
+        if active and unmatched:
+            crowded_ids = self._nearby_tracks(active)
+
+            # Build combined cost matrix (rows=tracks, cols=detections)
+            cost = np.ones((len(active), len(detections)))
+            for ti, t in enumerate(active):
+                for di in unmatched:
+                    iou_score = iou(detections[di]["box"], t.box)
+                    if iou_score < self.iou_threshold:
+                        continue  # leave at 1.0 = infeasible
+
+                    geo_cost = 1.0 - iou_score
+
+                    # Blend in appearance cost when tracks are crowded
+                    if t.id in crowded_ids and t.appearance is not None:
+                        det_hist = color_histogram(frame, detections[di]["box"]) if frame is not None else None
+                        app_cost = hist_distance(t.appearance, det_hist) if det_hist is not None else 0.5
+                        cost[ti, di] = (1 - self.appearance_weight) * geo_cost + self.appearance_weight * app_cost
+                    else:
+                        cost[ti, di] = geo_cost
+
+            row_ind, col_ind = linear_sum_assignment(cost)
+            matched_track_ids = set()
+            matched_det_ids   = set()
+            for ti, di in zip(row_ind, col_ind):
+                if cost[ti, di] < 1.0:  # feasible assignment
+                    active[ti].confirm(detections[di]["box"], frame)
+                    matched_track_ids.add(active[ti].id)
+                    matched_det_ids.add(di)
+
+            unmatched = [i for i in unmatched if i not in matched_det_ids]
+            for t in active:
+                if t.id not in matched_track_ids:
+                    t.extrapolate()
+
+        elif active:
+            for t in active:
                 t.extrapolate()
 
-        # Pass 2 — distance match to ghost tracks (with threshold)
+        # Pass 2 — distance match to ghost tracks (unchanged)
         ghosts = [t for t in self.tracks if t.is_ghost]
         matched_g = set()
         for t in ghosts:
@@ -304,31 +382,29 @@ class PersistentTracker:
                 if d < best_d:
                     best_d, best_i = d, i
             if best_i is not None:
-                t.confirm(detections[best_i]["box"])
+                t.confirm(detections[best_i]["box"], frame)
                 matched_g.add(t.id)
                 unmatched.remove(best_i)
         for t in ghosts:
             if t.id not in matched_g:
                 t.extrapolate()
 
-        # Pass 3 — remaining detections
+        # Pass 3 — spawn or force onto nearest ghost (unchanged logic)
         roster_full = len(self.tracks) >= self.max_tracks
         for i in unmatched:
             det = detections[i]
             if not roster_full and det.get("can_spawn", True):
                 self.tracks.append(
-                    Track(det["box"], det["class_id"], det["class_name"], self.trail_len)
+                    Track(det["box"], det["class_id"], det["class_name"],
+                          self.trail_len, frame)
                 )
                 roster_full = len(self.tracks) >= self.max_tracks
             else:
-                # Roster full — force onto nearest ghost, no threshold.
-                # A detection that cleared passes 1+2 must be a robot whose
-                # ghost drifted far (e.g. stopped behind a structure).
                 all_ghosts = [t for t in self.tracks if t.is_ghost]
                 if all_ghosts:
                     nearest = min(all_ghosts,
                                   key=lambda t: self._dist(det["box"], t.pred_cx, t.pred_cy))
-                    nearest.confirm(det["box"])
+                    nearest.confirm(det["box"], frame)
 
         self.tracks = [t for t in self.tracks if t.lost <= self.max_lost]
         return self.tracks
@@ -351,27 +427,37 @@ class RobotEntry:
 class RobotRegistry:
     """Permanent ordered log of every robot ever detected this video."""
 
-    def __init__(self):
+    def __init__(self, max_robots=6, min_frames_to_register=5):
         self.entries: dict[int, RobotEntry] = {}
+        self.pending: dict[int, RobotEntry] = {}  # seen but not yet confirmed
+        self.max_robots = max_robots
+        self.min_frames = min_frames_to_register
         self.video_width = 0
         self.video_height = 0
 
     def update(self, tracks: list):
         live_ids = {t.id for t in tracks}
+
         for t in tracks:
-            if t.id not in self.entries:
-                self.entries[t.id] = RobotEntry(t.id, t.class_name)
-            e = self.entries[t.id]
+            target = self.entries if t.id in self.entries else self.pending
+            if t.id not in target:
+                target[t.id] = RobotEntry(t.id, t.class_name)
+
+            e = target[t.id]
             if not t.is_ghost:
                 e.frames_seen += 1
                 e.frames_lost  = 0
                 e.status       = "ACTIVE"
-                # Record the centroid for path annotation
-                cx, cy = t.pred_cx, t.pred_cy
-                e.path.append((int(cx), int(cy)))
+                e.path.append((int(t.pred_cx), int(t.pred_cy)))
             else:
-                e.frames_lost  = t.lost
-                e.status       = "GHOST"
+                e.frames_lost = t.lost
+                e.status      = "GHOST"
+
+            # Graduate from pending to registry once stable and under cap
+            if t.id in self.pending and e.frames_seen >= self.min_frames:
+                if len(self.entries) < self.max_robots:
+                    self.entries[t.id] = self.pending.pop(t.id)
+
         for tid, e in self.entries.items():
             if tid not in live_ids:
                 e.status = "LOST"
@@ -638,7 +724,7 @@ def process_video(
                 match_threshold=cross_view_match,
             )
 
-            tracks = tracker.update(detections)
+            tracks = tracker.update(detections, frame=frame)
             registry.update(tracks)
 
             for track in tracks:
