@@ -14,6 +14,10 @@ Usage:
     pip install ultralytics opencv-python tqdm
     python detect_robots_persistent.py --input match.mp4 --weights best.pt
 
+From Claude:
+    .venv\Scripts\yt-dlp.exe "YouTube URL" -o match.mp4 -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4"
+    .venv\Scripts\python.exe path.py --input match.mp4 --robot_weights hawk_robot_model.pt --fuel_weights fuel_detector.pt --show --device cpu
+
 Key flags:
     --max-robots   6      hard cap on unique IDs (set to number of robots in match)
     --trail        8      frames of history to average velocity over
@@ -547,7 +551,8 @@ def draw_log_panel(frame, registry: RobotRegistry):
 def process_video(
     input_path:   Path,
     output_path:  Path,
-    weights_path: Path,
+    robot_weights_path: Path,
+    fuel_weights_path: Path,
     conf_thresh:  float = 0.4,
     iou_thresh:   float = 0.45,
     imgsz:        int   = 640,
@@ -565,8 +570,10 @@ def process_video(
     view_count:   int   = 1,
     cross_view_match: float = 0.08,
 ):
-    print(f"Loading model: {weights_path}")
-    model    = YOLO(str(weights_path))
+    print(f"Loading model: {robot_weights_path}")
+    print(f"Loading model: {fuel_weights_path}")
+    robot_model    = YOLO(str(robot_weights_path))
+    fuel_model = YOLO(str(fuel_weights_path))
     tracker  = PersistentTracker(
         iou_threshold=0.25,
         ghost_dist_px=ghost_dist,
@@ -603,24 +610,35 @@ def process_video(
                 break
             frame_idx += 1
 
-            results = model.predict(
+            robot_results = robot_model.predict(
                 source=frame, conf=conf_thresh, iou=iou_thresh,
                 imgsz=imgsz, device=device, verbose=False,
             )
-            result = results[0]
+            robot_result = robot_results[0]
+
+            fuel_results = fuel_model.predict(
+                source=frame, conf=conf_thresh, iou=iou_thresh,
+                imgsz=imgsz, device=device, verbose=False,
+            )
+            fuel_result = fuel_results[0]
 
             detections = []
-            if result.boxes is not None and len(result.boxes):
-                xyxy    = result.boxes.xyxy.cpu().numpy()
-                cls_ids = result.boxes.cls.cpu().numpy().astype(int)
+            if robot_result.boxes is not None and len(robot_result.boxes):
+                xyxy    = robot_result.boxes.xyxy.cpu().numpy()
+                cls_ids = robot_result.boxes.cls.cpu().numpy().astype(int)
                 for i in range(len(xyxy)):
                     cid = int(cls_ids[i])
                     detections.append({
                         "box":        list(map(int, xyxy[i])),
                         "class_id":   cid,
-                        "class_name": result.names.get(cid, f"cls{cid}"),
-                        "confidence": float(result.boxes.conf[i]),
+                        "class_name": robot_result.names.get(cid, f"cls{cid}"),
+                        "confidence": float(robot_result.boxes.conf[i]),
                     })
+
+            if fuel_result.boxes is not None and len(fuel_result.boxes):
+                xyxy = fuel_result.boxes.xyxy.cpu().numpy()
+                for i in range(len(xyxy)):
+                    cv2.rectangle(frame, (int(xyxy[i][0]), int(xyxy[i][1])), (int(xyxy[i][2]), int(xyxy[i][3])), (0, 255, 255), 1, cv2.LINE_AA)
 
             detections = filter_layout_detections(
                 detections=detections,
@@ -683,7 +701,8 @@ def process_video(
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--input",       required=True)
-    p.add_argument("--weights",     required=True)
+    p.add_argument("--robot_weights", required=True)
+    p.add_argument("--fuel_weights", required=True)
     p.add_argument("--output",      default="out_persistent.mp4")
     p.add_argument("--conf",        type=float, default=0.4)
     p.add_argument("--iou",         type=float, default=0.45)
@@ -715,7 +734,8 @@ def main():
     process_video(
         input_path   = Path(args.input),
         output_path  = Path(args.output),
-        weights_path = Path(args.weights),
+        robot_weights_path = Path(args.robot_weights),
+        fuel_weights_path = Path(args.fuel_weights),
         conf_thresh  = args.conf,
         iou_thresh   = args.iou,
         imgsz        = args.imgsz,
