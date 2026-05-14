@@ -1,5 +1,4 @@
-#TODO So the robot registry gets to 14 robots in total, however the robots keep swapping when they pass each other,
-# Is this just a training issue or could we help this with something in the code? Shorten robot registry to 6
+#TODO: Fix ghost assignment, the lost thing is not at all a bad idea, but it is too generalistic, need to define some more parameters to specialize it. 
 
 
 """
