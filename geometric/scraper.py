@@ -40,7 +40,7 @@ from tqdm import tqdm
 # Config
 # ---------------------------------------------------------------------------
 
-TBA_KEY   = os.environ.get("TBA_KEY", "")
+TBA_KEY   = "A1zE9cucdkqjWns5B1DAXijYnbWHhqQ7fS05PVQVjhbKP1Mx4bO4pRGhUcitZZgK"
 TBA_BASE  = "https://www.thebluealliance.com/api/v3"
 
 # FRC match is ~2:30. Skip the first and last N seconds
@@ -50,7 +50,7 @@ SKIP_START_SEC = 8
 SKIP_END_SEC   = 10
 
 # Extract 2 frames per second during the match window
-EXTRACT_FPS = 2.0
+EXTRACT_FPS = 5.0
 
 # Official event types only (no offseason/preseason)
 # 0=Regional, 1=District, 2=District Champ, 3=Champ Division, 4=Champ Finals
