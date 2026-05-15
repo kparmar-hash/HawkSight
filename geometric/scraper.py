@@ -32,6 +32,7 @@ import argparse
 import subprocess
 from pathlib import Path
 
+# pyrefly: ignore [missing-import]
 import cv2
 import requests
 from tqdm import tqdm
