@@ -50,7 +50,7 @@ SKIP_START_SEC = 8
 SKIP_END_SEC   = 10
 
 # Extract 2 frames per second during the match window
-EXTRACT_FPS = 5.0
+EXTRACT_FPS = 1.0
 
 # Official event types only (no offseason/preseason)
 # 0=Regional, 1=District, 2=District Champ, 3=Champ Division, 4=Champ Finals

@@ -29,4 +29,4 @@ def dedup_frames(frames_dir: str, threshold: int = 8):
     print(f"Removed {len(removed)} duplicates")
     print(f"Remaining: {len(frames) - len(removed)} frames")
 
-dedup_frames("dataset/raw/2026cancmp")
+dedup_frames("dataset/raw/2026ohmv")
