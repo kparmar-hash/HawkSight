@@ -1,5 +1,12 @@
-#TODO: Fix ghost assignment, the lost thing is not at all a bad idea, but it is too generalistic, need to define some more parameters to specialize it. 
+#TODO: Fix ghost assignment, the lost thing is not at all a bad idea, but 
+# it is too generalistic, need to define some more parameters to specialize it. 
+# TASKS:
+# 1.  For the ghost tracking we want it to return to last known position
+# after x number of frames, and be within the bounds of the field. Another thing: the ghost shouldn't move forever onward,
+# merely an updated position until robot fills in that space.
 
+# 2. for the side views, match the ghost tracking of current robot in the main view with detected but not spawned id in the side
+# view, if it's equal then you're tracking the same robot.
 
 """
 FRC Robot Detector — Persistent IDs + Robot Registry
@@ -39,6 +46,62 @@ from ultralytics.utils.plotting import Annotator
 
 # pyrefly: ignore [missing-import]
 from scipy.optimize import linear_sum_assignment
+
+
+def parse_frame_range(frame_range: str | None) -> tuple[int | None, int | None]:
+    """Parse optional frame range in the form `start:end` (1-based, inclusive)."""
+    if not frame_range:
+        return (None, None)
+
+    parts = frame_range.split(":", 1)
+    if len(parts) != 2:
+        raise ValueError("Frame range must be in start:end format")
+
+    start_text, end_text = parts[0].strip(), parts[1].strip()
+    start = int(start_text) if start_text else None
+    end = int(end_text) if end_text else None
+
+    if start is not None and start < 1:
+        raise ValueError("Frame range start must be >= 1")
+    if end is not None and end < 1:
+        raise ValueError("Frame range end must be >= 1")
+    if start is not None and end is not None and start > end:
+        raise ValueError("Frame range start must be <= end")
+
+    return (start, end)
+
+
+def seek_to_frame(cap: cv2.VideoCapture, input_path: Path, start_frame: int) -> cv2.VideoCapture:
+    """
+    Seek to a 1-based frame index.
+
+    OpenCV random seeking can be unreliable for some codecs, so fall back to
+    reopening and discarding frames until the requested start is reached.
+    """
+    if start_frame <= 1:
+        return cap
+
+    target_zero_based = start_frame - 1
+    cap.set(cv2.CAP_PROP_POS_FRAMES, target_zero_based)
+    landed = int(round(cap.get(cv2.CAP_PROP_POS_FRAMES)))
+    if abs(landed - target_zero_based) <= 1:
+        return cap
+
+    cap.release()
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        raise IOError(f"Cannot reopen: {input_path}")
+
+    skipped = 0
+    while skipped < target_zero_based:
+        ret, _ = cap.read()
+        if not ret:
+            raise ValueError(
+                f"Frame range start {start_frame} exceeds readable video length while skipping"
+            )
+        skipped += 1
+
+    return cap
 
 
 # ─────────────────────────────────────────────────────────────
@@ -231,6 +294,9 @@ class Track:
         self.lost        = 0
         self.pred_box    = list(box)
         self.pred_cx, self.pred_cy = self._centroid(box)
+        self.search_origin_box = list(box)
+        self.last_box    = list(box)
+        self.last_cx, self.last_cy = self.pred_cx, self.pred_cy
         # Appearance: rolling average of last N histograms
         self.appearance: np.ndarray | None = (
             color_histogram(frame, box) if frame is not None else None
@@ -267,20 +333,86 @@ class Track:
             self.centroids.pop(0)
         self.pred_box = list(box)
         self.pred_cx, self.pred_cy = c
+        self.search_origin_box = list(box)
+        self.last_box = list(box)
+        self.last_cx, self.last_cy = c
         if frame is not None:
             self.update_appearance(frame, box)
 
-    def extrapolate(self):
+    @staticmethod
+    def _clamp_box(box, frame_width: int | None, frame_height: int | None) -> list[int]:
+        if frame_width is None or frame_height is None:
+            return list(box)
+
+        x1, y1, x2, y2 = box
+        width = max(1, x2 - x1)
+        height = max(1, y2 - y1)
+
+        max_x1 = max(0, frame_width - width)
+        max_y1 = max(0, frame_height - height)
+        x1 = min(max(0, x1), max_x1)
+        y1 = min(max(0, y1), max_y1)
+        x2 = x1 + width
+        y2 = y1 + height
+        return [x1, y1, x2, y2]
+
+    def extrapolate(
+        self,
+        frame_width: int | None = None,
+        frame_height: int | None = None,
+        max_coast_frames: int = 24,
+        min_coast_scale: float = 0.35,
+        speed_scale: float = 1.0,
+    ):
         self.lost += 1
+        self.search_origin_box = list(self.pred_box)
+        if self.lost > max_coast_frames:
+            self.pred_box = self._clamp_box(self.last_box, frame_width, frame_height)
+            self.pred_cx, self.pred_cy = self._centroid(self.pred_box)
+            return
+
         vx, vy = self.velocity()
+        if max_coast_frames > 1:
+            progress = (self.lost - 1) / (max_coast_frames - 1)
+        else:
+            progress = 1.0
+        coast_scale = max(min_coast_scale, 1.0 - progress)
+        ghost_scale = max(0.0, speed_scale) * coast_scale
+
         w = self.pred_box[2] - self.pred_box[0]
         h = self.pred_box[3] - self.pred_box[1]
-        self.pred_cx = int(self.pred_cx + vx)
-        self.pred_cy = int(self.pred_cy + vy)
-        self.pred_box = [
-            self.pred_cx - w//2, self.pred_cy - h//2,
-            self.pred_cx + w//2, self.pred_cy + h//2,
+        next_cx = int(self.pred_cx + (vx * ghost_scale))
+        next_cy = int(self.pred_cy + (vy * ghost_scale))
+        next_box = [
+            next_cx - w//2, next_cy - h//2,
+            next_cx + w//2, next_cy + h//2,
         ]
+        self.pred_box = self._clamp_box(next_box, frame_width, frame_height)
+        self.pred_cx, self.pred_cy = self._centroid(self.pred_box)
+
+    def ghost_match_boxes(
+        self,
+        frame_width: int | None = None,
+        frame_height: int | None = None,
+        fractions: tuple[float, ...] = (1.0, 0.5, 0.0),
+    ) -> list[list[int]]:
+        origin = self.search_origin_box
+        target = self.pred_box
+        boxes: list[list[int]] = []
+        seen: set[tuple[int, int, int, int]] = set()
+
+        for fraction in fractions:
+            box = [
+                int(round(origin[idx] + ((target[idx] - origin[idx]) * fraction)))
+                for idx in range(4)
+            ]
+            clamped = self._clamp_box(box, frame_width, frame_height)
+            key = tuple(clamped)
+            if key not in seen:
+                seen.add(key)
+                boxes.append(clamped)
+
+        return boxes
 
     @property
     def is_ghost(self) -> bool:
@@ -297,8 +429,8 @@ class PersistentTracker:
 
     Pass 1 — active tracks matched by IoU.
     Pass 2 — ghost tracks matched by distance from dead-reckoned centroid.
-    Pass 3 — if roster < max_tracks: spawn new track from spawn-eligible views.
-              if roster full: force onto nearest ghost (no distance limit).
+        Pass 3 — prefer reclaiming an existing ghost ID.
+              Only create a brand-new ID when no ghost exists to recycle.
               This guarantees IDs never exceed max_tracks after the roster
               fills, so robots reappearing from the trench or behind a
               structure always recover their original ID.
@@ -306,12 +438,16 @@ class PersistentTracker:
 
     def __init__(self, iou_threshold=0.25, ghost_dist_px=120,
                  max_lost=150, trail_len=8, max_tracks=6,
+                 ghost_coast_frames=24,
+                 ghost_speed_scale=1.0,
                  appearance_weight=0.35):
         self.iou_threshold    = iou_threshold
         self.ghost_dist_px    = ghost_dist_px
         self.max_lost         = max_lost
         self.trail_len        = trail_len
         self.max_tracks       = max_tracks
+        self.ghost_coast_frames = ghost_coast_frames
+        self.ghost_speed_scale = ghost_speed_scale
         self.appearance_weight = appearance_weight  # 0 = pure geometry, 1 = pure appearance
         self.tracks: list[Track] = []
 
@@ -321,6 +457,22 @@ class PersistentTracker:
     def _dist(self, box, tx, ty):
         cx, cy = self._centroid(box)
         return ((cx-tx)**2 + (cy-ty)**2) ** 0.5
+
+    def _ghost_match_distance(
+        self,
+        det_box,
+        track: Track,
+        frame_width: int | None = None,
+        frame_height: int | None = None,
+    ) -> float:
+        best_distance = float("inf")
+        for candidate_box in track.ghost_match_boxes(
+            frame_width=frame_width,
+            frame_height=frame_height,
+        ):
+            cx, cy = self._centroid(candidate_box)
+            best_distance = min(best_distance, self._dist(det_box, cx, cy))
+        return best_distance
 
     def _nearby_tracks(self, tracks: list[Track], distance_px: float = 120.0) -> set[int]:
         crowded_ids: set[int] = set()
@@ -333,6 +485,7 @@ class PersistentTracker:
         return crowded_ids
 
     def update(self, detections: list[dict], frame=None) -> list[Track]:
+        frame_height, frame_width = frame.shape[:2] if frame is not None else (None, None)
         main_detections = [det for det in detections if det.get("can_spawn", True)]
         aux_detections = [det for det in detections if not det.get("can_spawn", True)]
         unmatched_main = list(range(len(main_detections)))
@@ -369,14 +522,24 @@ class PersistentTracker:
 
         for t in active:
             if t.id not in matched_track_ids:
-                t.extrapolate()
+                t.extrapolate(
+                    frame_width=frame_width,
+                    frame_height=frame_height,
+                    max_coast_frames=self.ghost_coast_frames,
+                    speed_scale=self.ghost_speed_scale,
+                )
 
         ghosts = [t for t in self.tracks if t.is_ghost]
         matched_ghost_ids = set()
         for t in ghosts:
             best_d, best_i = self.ghost_dist_px, None
             for i in unmatched_main:
-                d = self._dist(main_detections[i]["box"], t.pred_cx, t.pred_cy)
+                d = self._ghost_match_distance(
+                    main_detections[i]["box"],
+                    t,
+                    frame_width=frame_width,
+                    frame_height=frame_height,
+                )
                 if d < best_d:
                     best_d, best_i = d, i
             if best_i is not None:
@@ -385,27 +548,29 @@ class PersistentTracker:
                 unmatched_main.remove(best_i)
         for t in ghosts:
             if t.id not in matched_ghost_ids:
-                t.extrapolate()
+                t.extrapolate(
+                    frame_width=frame_width,
+                    frame_height=frame_height,
+                    max_coast_frames=self.ghost_coast_frames,
+                    speed_scale=self.ghost_speed_scale,
+                )
 
-        roster_full = len(self.tracks) >= self.max_tracks
         spawned_or_forced_ids = set()
         for i in unmatched_main:
             det = main_detections[i]
-            if not roster_full:
+            all_ghosts = [t for t in self.tracks if t.is_ghost]
+            if all_ghosts:
+                nearest = min(
+                    all_ghosts,
+                    key=lambda t: self._dist(det["box"], t.pred_cx, t.pred_cy),
+                )
+                nearest.confirm(det["box"], frame)
+                spawned_or_forced_ids.add(nearest.id)
+            elif len(self.tracks) < self.max_tracks:
                 new_track = Track(det["box"], det["class_id"], det["class_name"],
                                   self.trail_len, frame)
                 self.tracks.append(new_track)
                 spawned_or_forced_ids.add(new_track.id)
-                roster_full = len(self.tracks) >= self.max_tracks
-            else:
-                all_ghosts = [t for t in self.tracks if t.is_ghost]
-                if all_ghosts:
-                    nearest = min(
-                        all_ghosts,
-                        key=lambda t: self._dist(det["box"], t.pred_cx, t.pred_cy),
-                    )
-                    nearest.confirm(det["box"], frame)
-                    spawned_or_forced_ids.add(nearest.id)
 
         # Auxiliary views can refine existing tracks, but never spawn IDs.
         unmatched_aux = list(range(len(aux_detections)))
@@ -437,14 +602,18 @@ class PersistentTracker:
         for t in aux_ghosts:
             best_d, best_i = self.ghost_dist_px, None
             for i in unmatched_aux:
-                d = self._dist(aux_detections[i]["box"], t.pred_cx, t.pred_cy)
+                d = self._ghost_match_distance(
+                    aux_detections[i]["box"],
+                    t,
+                    frame_width=frame_width,
+                    frame_height=frame_height,
+                )
                 if d < best_d:
                     best_d, best_i = d, i
             if best_i is not None:
                 t.confirm(aux_detections[best_i]["box"], frame)
                 unmatched_aux.remove(best_i)
 
-        self.tracks = [t for t in self.tracks if t.lost <= self.max_lost]
         return self.tracks
 
         unmatched = list(range(len(detections)))
@@ -538,7 +707,7 @@ class RobotEntry:
         self.class_name  = class_name
         self.frames_seen = 0
         self.frames_lost = 0
-        self.status      = "ACTIVE"   # ACTIVE | GHOST | LOST
+        self.status      = "ACTIVE"   # ACTIVE | GHOST
         self.path        = []         # List of (x, y) centroids
 
 
@@ -578,7 +747,7 @@ class RobotRegistry:
 
         for tid, e in self.entries.items():
             if tid not in live_ids:
-                e.status = "LOST"
+                e.status = "GHOST"
 
     def ordered(self) -> list:
         return sorted(self.entries.values(), key=lambda e: e.track_id)
@@ -762,12 +931,15 @@ def process_video(
     predict_px:   int   = 40,
     max_lost:     int   = 150,
     ghost_dist:   int   = 120,
+    ghost_coast_frames: int = 24,
+    ghost_speed_scale: float = 1.0,
     pad:          int   = 18,
     max_robots:   int   = 6,
     layout_mode:  str   = "full-frame",
     main_view_bottom_ratio: float = 1.0,
     view_count:   int   = 1,
     cross_view_match: float = 0.08,
+    frame_range: str | None = None,
 ):
     print(f"Loading model: {weights_path}")
     model    = YOLO(str(weights_path))
@@ -777,6 +949,8 @@ def process_video(
         max_lost=max_lost,
         trail_len=trail_len,
         max_tracks=max_robots,
+        ghost_coast_frames=ghost_coast_frames,
+        ghost_speed_scale=ghost_speed_scale,
     )
     registry = RobotRegistry()
 
@@ -788,24 +962,41 @@ def process_video(
     src_fps      = cap.get(cv2.CAP_PROP_FPS) or 30.0
     w            = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h            = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    start_frame, end_frame = parse_frame_range(frame_range)
+
+    if start_frame is None:
+        start_frame = 1
+    if end_frame is None:
+        end_frame = total_frames
+    end_frame = min(end_frame, total_frames)
     
     registry.video_width = w
     registry.video_height = h
     print(f"Video: {w}x{h}  {src_fps:.2f} fps  {total_frames} frames")
+    print(f"Tracking frames: {start_frame}:{end_frame}")
+
+    if start_frame > total_frames:
+        raise ValueError(f"Frame range start {start_frame} exceeds video length {total_frames}")
+
+    cap = seek_to_frame(cap, input_path, start_frame)
 
     writer = cv2.VideoWriter(
         str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), src_fps, (w, h)
     )
 
-    frame_idx = 0
+    frame_idx = start_frame - 1
+    processed_frames = 0
     t_start   = time.perf_counter()
 
-    with tqdm(total=total_frames, unit="frame", desc="Tracking") as pbar:
+    with tqdm(total=(end_frame - start_frame + 1), unit="frame", desc="Tracking") as pbar:
         while True:
+            if frame_idx >= end_frame:
+                break
             ret, frame = cap.read()
             if not ret:
                 break
             frame_idx += 1
+            processed_frames += 1
 
             results = model.predict(
                 source=frame, conf=conf_thresh, iou=iou_thresh,
@@ -850,7 +1041,7 @@ def process_video(
                            show_labels=show_labels, pad=pad)
 
             elapsed  = time.perf_counter() - t_start
-            proc_fps = frame_idx / elapsed if elapsed > 0 else 0
+            proc_fps = processed_frames / elapsed if elapsed > 0 else 0
             active   = sum(1 for t in tracks if not t.is_ghost)
             ghost    = sum(1 for t in tracks if t.is_ghost)
             draw_hud(frame, frame_idx, total_frames, proc_fps, active, ghost)
@@ -871,7 +1062,8 @@ def process_video(
         cv2.destroyAllWindows()
 
     elapsed = time.perf_counter() - t_start
-    print(f"\nDone -- {frame_idx} frames in {elapsed:.1f}s ({frame_idx/elapsed:.1f} fps)")
+    fps = (processed_frames / elapsed) if elapsed > 0 else 0.0
+    print(f"\nDone -- {processed_frames} frames in {elapsed:.1f}s ({fps:.1f} fps)")
     print(f"\n-- Final Robot Registry --")
     for e in registry.ordered():
         print(f"  #{e.track_id}  {e.class_name:<12}  seen:{e.frames_seen:>5}f  {e.status}")
@@ -901,6 +1093,10 @@ def main():
                    help="Frames a ghost survives (150=5s@30fps)")
     p.add_argument("--ghost-dist",  type=int,   default=120,
                    help="Distance threshold (px) for normal ghost re-association")
+    p.add_argument("--ghost-coast", type=int,   default=24,
+                   help="Frames a ghost may drift with slowing motion before snapping back to its last seen position")
+    p.add_argument("--ghost-speed", type=float, default=1.0,
+                   help="Multiplier for how fast ghost predictions move along the velocity vector")
     p.add_argument("--pad",         type=int,   default=18,
                    help="Pixels to expand each bounding box outward on all sides")
     p.add_argument("--max-robots",  type=int,   default=6,
@@ -914,6 +1110,8 @@ def main():
                    help="Number of equal-width stitched views in each frame")
     p.add_argument("--cross-view-match", type=float, default=0.08,
                    help="Normalized distance threshold for merging the same robot across views")
+    p.add_argument("--frame-range", type=str, default=None,
+                   help="Optional 1-based inclusive frame range in start:end form, e.g. 450:520")
     args = p.parse_args()
 
     process_video(
@@ -930,12 +1128,15 @@ def main():
         predict_px   = args.predict,
         max_lost     = args.max_lost,
         ghost_dist   = args.ghost_dist,
+        ghost_coast_frames = args.ghost_coast,
+        ghost_speed_scale = args.ghost_speed,
         pad          = args.pad,
         max_robots   = args.max_robots,
         layout_mode  = args.layout_mode,
         main_view_bottom_ratio = args.main_view_bottom_ratio,
         view_count   = args.view_count,
         cross_view_match = args.cross_view_match,
+        frame_range = args.frame_range,
     )
 
 if __name__ == "__main__":
