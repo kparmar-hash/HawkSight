@@ -16,7 +16,7 @@ Usage:
 
 From Claude:
     .venv\Scripts\yt-dlp.exe "YouTube URL" -o match.mp4 -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4"
-    .venv\Scripts\python.exe path.py --input match.mp4 --robot_weights hawk_robot_model.pt --fuel_weights fuel_detector.pt --show --device cpu
+    .venv\Scripts\python.exe path.py --input match.mp4 --robot_weights runs/detect/runs/train/exp/weights/best.pt --fuel_weights match_fuel_detector.pt --show --device cpu
 
 Key flags:
     --max-robots   6      hard cap on unique IDs (set to number of robots in match)
@@ -488,7 +488,7 @@ def draw_hud(frame, frame_idx, total_frames, proc_fps, active, ghost):
         y += 22
 
 
-def draw_log_panel(frame, registry: RobotRegistry):
+def draw_robot_log_panel(frame, registry: RobotRegistry):
     """Bottom-right panel showing every robot ever detected."""
     entries = registry.ordered()
     if not entries:
@@ -543,6 +543,29 @@ def draw_log_panel(frame, registry: RobotRegistry):
                     (px1+margin+swatch_w+6, ry+th+18),
                     font, 0.38, status_color, 1, cv2.LINE_AA)
 
+def draw_fuel_log_panel(frame, detections: int):
+    detection_num = detections
+
+    fh, fw   = frame.shape[:2]
+    font     = cv2.FONT_HERSHEY_SIMPLEX
+    fs       = 0.50
+
+    sample      = "Fuel Detected: 9999"
+    (tw, th), _ = cv2.getTextSize(sample, font, fs, 1)
+    frame_margin = 10
+    panel_margin = 30
+
+    px1 = frame_margin
+    py1 = fh - frame_margin - th - panel_margin
+    px2 = px1 + tw + panel_margin
+    py2 = fh - frame_margin
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (px1, py1), (px2, py2), (15, 15, 15), -1)
+    cv2.addWeighted(overlay,0.75,frame,0.25,0,frame)
+    cv2.rectangle(frame, (px1,py1), (px2,py2), (70,70,70), 1)
+
+    cv2.putText(frame, f"Fuel Detected: {detection_num}", (px1 + (panel_margin // 2), py2 - (panel_margin // 2)), font, fs, (80, 200, 255), 1, cv2.LINE_AA)
 
 # ─────────────────────────────────────────────────────────────
 # Pipeline
@@ -553,8 +576,10 @@ def process_video(
     output_path:  Path,
     robot_weights_path: Path,
     fuel_weights_path: Path,
-    conf_thresh:  float = 0.4,
-    iou_thresh:   float = 0.45,
+    robot_conf_thresh:  float = 0.4,
+    robot_iou_thresh:   float = 0.45,
+    fuel_conf_thresh:   float = 0.1,
+    fuel_iou_thresh:   float = 0.15,
     imgsz:        int   = 640,
     device:       str   = "0",
     show:         bool  = False,
@@ -611,13 +636,13 @@ def process_video(
             frame_idx += 1
 
             robot_results = robot_model.predict(
-                source=frame, conf=conf_thresh, iou=iou_thresh,
+                source=frame, conf=robot_conf_thresh, iou=robot_iou_thresh,
                 imgsz=imgsz, device=device, verbose=False,
             )
             robot_result = robot_results[0]
 
             fuel_results = fuel_model.predict(
-                source=frame, conf=conf_thresh, iou=iou_thresh,
+                source=frame, conf=fuel_conf_thresh, iou=fuel_iou_thresh,
                 imgsz=imgsz, device=device, verbose=False,
             )
             fuel_result = fuel_results[0]
@@ -635,10 +660,12 @@ def process_video(
                         "confidence": float(robot_result.boxes.conf[i]),
                     })
 
+            fuel_detections = 0
             if fuel_result.boxes is not None and len(fuel_result.boxes):
                 xyxy = fuel_result.boxes.xyxy.cpu().numpy()
                 for i in range(len(xyxy)):
-                    cv2.rectangle(frame, (int(xyxy[i][0]), int(xyxy[i][1])), (int(xyxy[i][2]), int(xyxy[i][3])), (0, 255, 255), 1, cv2.LINE_AA)
+                    cv2.rectangle(frame, (int(xyxy[i][0]), int(xyxy[i][1])), (int(xyxy[i][2]), int(xyxy[i][3])), (255, 0, 0), 1, cv2.LINE_AA)
+                    fuel_detections = fuel_detections + 1
 
             detections = filter_layout_detections(
                 detections=detections,
@@ -668,7 +695,8 @@ def process_video(
             active   = sum(1 for t in tracks if not t.is_ghost)
             ghost    = sum(1 for t in tracks if t.is_ghost)
             draw_hud(frame, frame_idx, total_frames, proc_fps, active, ghost)
-            draw_log_panel(frame, registry)
+            draw_robot_log_panel(frame, registry)
+            draw_fuel_log_panel(frame, fuel_detections)
 
             writer.write(frame)
 
@@ -704,8 +732,10 @@ def main():
     p.add_argument("--robot_weights", required=True)
     p.add_argument("--fuel_weights", required=True)
     p.add_argument("--output",      default="out_persistent.mp4")
-    p.add_argument("--conf",        type=float, default=0.4)
-    p.add_argument("--iou",         type=float, default=0.45)
+    p.add_argument("--robot_conf",        type=float, default=0.4)
+    p.add_argument("--robot_iou",         type=float, default=0.45)
+    p.add_argument("--fuel_conf",        type=float, default=0.1)
+    p.add_argument("--fuel_iou",         type=float, default=0.15)
     p.add_argument("--imgsz",       type=int,   default=640)
     p.add_argument("--device",      type=str,   default="0")
     p.add_argument("--show",        action="store_true")
@@ -736,8 +766,10 @@ def main():
         output_path  = Path(args.output),
         robot_weights_path = Path(args.robot_weights),
         fuel_weights_path = Path(args.fuel_weights),
-        conf_thresh  = args.conf,
-        iou_thresh   = args.iou,
+        robot_conf_thresh  = args.robot_conf,
+        robot_iou_thresh   = args.robot_iou,
+        fuel_conf_thresh   = args.fuel_conf,
+        fuel_iou_thresh   = args.fuel_iou,
         imgsz        = args.imgsz,
         device       = args.device,
         show         = args.show,
