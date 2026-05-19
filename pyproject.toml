@@ -1,0 +1,20 @@
+[project]
+name = "hawksight"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "duckduckgo-search>=8.1.1",
+    "imagededup>=0.3.3.post2",
+    "numpy>=2.4.6",
+    "opencv-python>=4.13.0.92",
+    "pillow>=12.2.0",
+    "pyyaml>=6.0.3",
+    "requests>=2.34.2",
+    "scikit-learn>=1.8.0",
+    "supervision>=0.28.0",
+    "tqdm>=4.67.3",
+    "ultralytics>=8.4.51",
+    "yt-dlp>=2026.3.17",
+]

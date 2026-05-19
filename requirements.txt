@@ -9,4 +9,4 @@ supervision
 scikit-learn
 pyyaml
 numpy
-imagededupe
+imagededup
