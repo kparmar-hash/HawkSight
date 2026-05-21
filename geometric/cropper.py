@@ -20,8 +20,6 @@ from pathlib import Path
 # pyrefly: ignore [missing-import]
 import cv2
 from tqdm import tqdm
-# pyrefly: ignore [missing-import]
-from ultralytics import YOLO
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,6 +43,26 @@ DEFAULT_QUALITY = 95      # JPEG save quality
 # Core
 # ---------------------------------------------------------------------------
 
+def resize_crop_for_labeling(crop, max_dimension: int):
+    """Downscale large crops for labeling while preserving native detail."""
+    if max_dimension <= 0:
+        return crop
+
+    crop_height, crop_width = crop.shape[:2]
+    largest_dimension = max(crop_width, crop_height)
+    if largest_dimension <= max_dimension:
+        return crop
+
+    scale_ratio = max_dimension / largest_dimension
+    resized_width = max(1, round(crop_width * scale_ratio))
+    resized_height = max(1, round(crop_height * scale_ratio))
+
+    return cv2.resize(
+        crop,
+        (resized_width, resized_height),
+        interpolation=cv2.INTER_AREA,
+    )
+
 def extract_crops(
     weights:    str,
     frames_dir: str,
@@ -61,6 +79,9 @@ def extract_crops(
 
     Returns a summary dict.
     """
+    # REASON: Delaying the import keeps resize tests independent from the YOLO runtime.
+    from ultralytics import YOLO  # pyrefly: ignore [missing-import]
+
     model  = YOLO(weights)
     frames = sorted(Path(frames_dir).rglob("*.jpg"))
 
@@ -120,9 +141,7 @@ def extract_crops(
 
             crop = img[cy1:cy2, cx1:cx2]
 
-            # Resize to uniform size for consistent labeling UX in CVAT
-            if resize:
-                crop = cv2.resize(crop, (resize, resize), interpolation=cv2.INTER_LINEAR)
+            crop = resize_crop_for_labeling(crop, resize)
 
             # Filename encodes source frame + detection index for traceability
             stem     = img_path.stem
